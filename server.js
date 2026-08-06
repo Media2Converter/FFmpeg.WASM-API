@@ -22,11 +22,10 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('FFmpeg + ExifTool 安全エラーハンドリング対応 API サーバーは正常稼働中です。');
+  res.send('FFmpeg API サーバー（詳細コーデック・フォーマット補正対応版）は正常稼働中です。');
 });
 
-// コマンド安全実行関数 (spawn使用でデッドロックとフリーズを防止)
-function runSafeCommand(cmd, args, timeoutMs = 120000) {
+function runSafeCommand(cmd, args, timeoutMs = 150000) {
   return new Promise((resolve) => {
     console.log(`[EXEC] ${cmd} ${args.join(' ')}`);
     const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -36,12 +35,12 @@ function runSafeCommand(cmd, args, timeoutMs = 120000) {
 
     const timer = setTimeout(() => {
       if (!isFinished) {
-        console.warn(`[TIMEOUT] 命令が指定時間(${timeoutMs}ms)内に応答しないため強制中断します: ${cmd}`);
+        console.warn(`[TIMEOUT] 強制中断: ${cmd}`);
         proc.kill('SIGKILL');
       }
     }, timeoutMs);
 
-    proc.stdout.on('data', () => {}); // バッファ解放のため空読み
+    proc.stdout.on('data', () => {});
     proc.stderr.on('data', (data) => {
       stderrData += data.toString();
     });
@@ -49,18 +48,12 @@ function runSafeCommand(cmd, args, timeoutMs = 120000) {
     proc.on('close', (code) => {
       isFinished = true;
       clearTimeout(timer);
-      if (code === 0) {
-        resolve({ success: true, stderr: stderrData });
-      } else {
-        console.warn(`[WARN] コマンド終了コード ${code}: ${stderrData.slice(-300)}`);
-        resolve({ success: false, stderr: stderrData });
-      }
+      resolve({ success: code === 0, stderr: stderrData });
     });
 
     proc.on('error', (err) => {
       isFinished = true;
       clearTimeout(timer);
-      console.error(`[ERROR] プロセス起動失敗: ${err.message}`);
       resolve({ success: false, stderr: err.message });
     });
   });
@@ -71,15 +64,22 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     return res.status(400).json({ error: 'ファイルがアップロードされていません。' });
   }
 
-  const format = req.body.format || 'mp4';
-  const resolution = req.body.resolution || 'original';
-  const framerate = req.body.framerate || 'original';
-  const audioBitrate = req.body.audioBitrate || '128k';
+  // クレンジング処理： "avi,avi" などのカンマ区切り重複や不要文字を除去
+  let rawFormat = req.body.format || 'mp4';
+  const cleanFormat = rawFormat.split(',')[0].trim().toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+
+  const resolution = req.body.resolution || 'original'; //例: '320x240', '720p'
+  const framerate = req.body.framerate || 'original';   //例: '12'
+  const vcodec = req.body.vcodec || '';                 //例: 'mjpeg', 'h264'
+  const acodec = req.body.acodec || '';                 //例: 'pcm_s16le', 'aac'
+  const videoBitrate = req.body.videoBitrate || '';     //例: '640k'
+  const audioBitrate = req.body.audioBitrate || '';     //例: '32k'
+  const sampleRate = req.body.sampleRate || '';         //例: '8000'
 
   const timestamp = Date.now();
   const inputPath = req.file.path;
-  const ffmpegOutputPath = path.join(uploadDir, `ffmpeg_${timestamp}.${format}`);
-  const finalOutputPath = path.join(uploadDir, `output_${timestamp}.${format}`);
+  const ffmpegOutputPath = path.join(uploadDir, `ffmpeg_${timestamp}.${cleanFormat}`);
+  const finalOutputPath = path.join(uploadDir, `output_${timestamp}.${cleanFormat}`);
 
   const cleanup = () => {
     [inputPath, ffmpegOutputPath, finalOutputPath].forEach((filePath) => {
@@ -90,59 +90,89 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   };
 
   try {
-    console.log(`[${timestamp}] 変換リクエスト開始: ${req.file.originalname} (${format})`);
+    console.log(`[${timestamp}] 変換リクエスト開始: ${req.file.originalname} -> ${cleanFormat}`);
 
-    // STEP 1: ExifTool 事前メタデータクレンジング (失敗しても止まらず次へフォールバック)
+    // STEP 1: ExifTool 事前クレンジング (失敗時は無視)
     const preExifArgs = ['-overwrite_original', '-all=', '-tagsFromFile', inputPath, '-all:all', inputPath];
     await runSafeCommand('exiftool', preExifArgs, 15000);
 
-    // STEP 2: FFmpeg 頑丈変換コマンド構築
+    // STEP 2: FFmpeg コマンドの動的構築
     const ffmpegArgs = [
       '-y',
-      '-nostdin',                         // 対話モード無効化（フリーズ防止）
-      '-fflags', '+genpts+discardcorrupt', // 壊れたフレーム・PTSを補正して通過
-      '-err_detect', 'ignore_err',        // エラー無視で処理継続
+      '-nostdin',
+      '-fflags', '+genpts+discardcorrupt',
+      '-err_detect', 'ignore_err',
       '-i', inputPath
     ];
 
-    // 解像度フィルターの設定
-    if (resolution === '1080p') ffmpegArgs.push('-vf', 'scale=-2:1080');
-    else if (resolution === '720p') ffmpegArgs.push('-vf', 'scale=-2:720');
-    else if (resolution === '480p') ffmpegArgs.push('-vf', 'scale=-2:480');
+    // 映像コーデック
+    if (vcodec) {
+      ffmpegArgs.push('-c:v', vcodec);
+    } else if (cleanFormat === 'avi') {
+      ffmpegArgs.push('-c:v', 'mjpeg'); // AVI指定時、未指定ならMJPEG
+    } else if (cleanFormat === 'webm') {
+      ffmpegArgs.push('-c:v', 'libvpx-vp9');
+    } else {
+      ffmpegArgs.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p');
+    }
 
-    // フレームレート設定
+    // 解像度の設定 (320x240 形式 または 1080p などの表記に対応)
+    if (resolution.includes('x')) {
+      ffmpegArgs.push('-vf', `scale=${resolution.replace('x', ':')}`);
+    } else if (resolution === '1080p') {
+      ffmpegArgs.push('-vf', 'scale=-2:1080');
+    } else if (resolution === '720p') {
+      ffmpegArgs.push('-vf', 'scale=-2:720');
+    } else if (resolution === '480p') {
+      ffmpegArgs.push('-vf', 'scale=-2:480');
+    }
+
+    // フレームレートの設定
     if (framerate !== 'original' && !isNaN(framerate)) {
       ffmpegArgs.push('-r', framerate);
     }
 
-    // コーデック設定
-    if (format === 'webm') {
-      ffmpegArgs.push('-c:v', 'libvpx-vp9', '-c:a', 'libopus', '-b:a', audioBitrate);
+    // 映像ビットレート
+    if (videoBitrate) {
+      ffmpegArgs.push('-b:v', videoBitrate);
+    }
+
+    // 音声コーデック
+    if (acodec) {
+      ffmpegArgs.push('-c:a', acodec);
+    } else if (cleanFormat === 'avi') {
+      ffmpegArgs.push('-c:a', 'pcm_s16le'); // AVI指定時、未指定ならPCM
+    } else if (cleanFormat === 'webm') {
+      ffmpegArgs.push('-c:a', 'libopus');
     } else {
-      ffmpegArgs.push(
-        '-c:v', 'libx264',
-        '-pix_fmt', 'yuv420p',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-c:a', 'aac',
-        '-b:a', audioBitrate,
-        '-max_muxing_queue_size', '1024',
-        '-movflags', '+faststart'
-      );
+      ffmpegArgs.push('-c:a', 'aac');
+    }
+
+    // 音声サンプリングレート (例: 8000Hz)
+    if (sampleRate && !isNaN(sampleRate)) {
+      ffmpegArgs.push('-ar', sampleRate);
+    }
+
+    // 音声ビットレート
+    if (audioBitrate) {
+      ffmpegArgs.push('-b:a', audioBitrate);
+    }
+
+    // フォーマット固有の最適化
+    if (cleanFormat === 'mp4' || cleanFormat === 'mov') {
+      ffmpegArgs.push('-movflags', '+faststart');
     }
 
     ffmpegArgs.push(ffmpegOutputPath);
 
-    // FFmpeg 実行 (最大150秒)
     const ffmpegResult = await runSafeCommand('ffmpeg', ffmpegArgs, 150000);
 
-    // FFmpeg 出力ファイルの存在確認
     if (!fs.existsSync(ffmpegOutputPath) || fs.statSync(ffmpegOutputPath).size === 0) {
-      throw new Error(`FFmpeg 変換失敗: ${ffmpegResult.stderr.slice(-300)}`);
+      throw new Error(`FFmpeg 変換失敗: ${ffmpegResult.stderr.slice(-400)}`);
     }
 
-    // STEP 3: ExifTool による iPhone 向け最適化タグの付与 (失敗しても無視して FFmpeg 出力を返却)
-    if (format === 'mp4' || format === 'mov') {
+    // STEP 3: MP4/MOVの場合の ExifTool 後処理
+    if (cleanFormat === 'mp4' || cleanFormat === 'mov') {
       const postExifArgs = [
         '-overwrite_original_in_place',
         '-out', finalOutputPath,
@@ -156,28 +186,25 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       await runSafeCommand('exiftool', postExifArgs, 20000);
     }
 
-    // 最終的に存在するファイルを選択
     const sendFilePath = fs.existsSync(finalOutputPath) && fs.statSync(finalOutputPath).size > 0 
       ? finalOutputPath 
       : ffmpegOutputPath;
 
-    res.download(sendFilePath, `output.${format}`, (err) => {
-      if (err) console.error('レスポンス送信エラー:', err);
+    res.download(sendFilePath, `output.${cleanFormat}`, (err) => {
+      if (err) console.error('ファイル送信エラー:', err);
       cleanup();
     });
 
   } catch (err) {
-    console.error(`[${timestamp}] エラー判定により中断:`, err.message);
+    console.error(`[${timestamp}] 変換処理失敗:`, err.message);
     cleanup();
     return res.status(500).json({
-      error: '動画の変換処理に失敗しました。ファイル破損が深刻か、サポートされていないコーデックです。',
+      error: '動画の変換処理に失敗しました。設定値の組み合わせを確認してください。',
       details: err.message
     });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Careful対応サーバーが起動しました: http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`API Server Active on Port ${PORT}`));
 
