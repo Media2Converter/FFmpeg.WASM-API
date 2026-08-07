@@ -13,7 +13,23 @@ if (!fs.existsSync(uploadDir)) {
 
 const upload = multer({ dest: uploadDir });
 
-// 強力な CORS 設定（どんなオリジン・プリフライトリクエストもすべて即座に許可）
+// 日本時間 (JST) 営業時間制御 (06:00 〜 23:00)
+const checkBusinessHours = (req, res, next) => {
+  const nowJST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+  const hour = nowJST.getHours();
+
+  if (hour < 6 || hour >= 23) {
+    if (req.path === '/api/convert') {
+      return res.status(403).json({
+        error: 'サーバの営業時間が終了しました。',
+        details: '本サーバーの作戦運用時間は 06:00 〜 23:00 です。'
+      });
+    }
+  }
+  next();
+};
+
+// 全CORS通信の完全許可 (CORSエラー・通信失敗の防止)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
@@ -26,9 +42,67 @@ app.use((req, res, next) => {
   next();
 });
 
-// ヘルスチェックルート（サーバー起爆用）
+app.use(checkBusinessHours);
+
+// サーバー直接アクセス時の表示画面 (弾薬モード・ダーク背景・白文字)
 app.get('/', (req, res) => {
-  res.status(200).send('FFmpeg API サーバーは正常稼働中です。');
+  const nowJST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+  const hour = nowJST.getHours();
+  const isWorking = (hour >= 6 && hour < 23);
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>FFmpeg API サーバー - 弾薬モード</title>
+      <style>
+        body {
+          background-color: #121411;
+          color: #ffffff;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+          text-align: center;
+        }
+        .card {
+          background: #1c201a;
+          padding: 32px 24px;
+          border-radius: 12px;
+          border: 2px solid #3b4438;
+          box-shadow: 0 12px 40px rgba(0,0,0,0.8);
+          max-width: 400px;
+          width: 90%;
+        }
+        h1 { font-size: 20px; color: #d4af37; margin-bottom: 12px; }
+        p { font-size: 14px; color: #f0f2ee; margin: 8px 0; }
+        .badge {
+          display: inline-block;
+          padding: 8px 18px;
+          border-radius: 6px;
+          font-weight: bold;
+          font-size: 13px;
+          margin-top: 16px;
+        }
+        .open { background: #193822; color: #81c784; border: 1px solid #2e5c38; }
+        .closed { background: #3d1c1d; color: #e57373; border: 1px solid #6b2d2f; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>FFmpeg API サーバー</h1>
+        ${isWorking 
+          ? '<p>GitHubサーバーは正常に作戦稼働中です。</p><div class="badge open">● 営業時間内 (06:00〜23:00)</div>' 
+          : '<p>サーバの営業時間が終了しました。</p><div class="badge closed">● 営業時間外 (06:00〜23:00)</div>'}
+      </div>
+    </body>
+    </html>
+  `;
+  res.status(200).send(html);
 });
 
 function runSafeCommand(cmd, args, timeoutMs = 180000) {
@@ -41,7 +115,7 @@ function runSafeCommand(cmd, args, timeoutMs = 180000) {
 
     const timer = setTimeout(() => {
       if (!isFinished) {
-        console.warn(`[TIMEOUT] プロセス強制終了: ${cmd}`);
+        console.warn(`[TIMEOUT] プロセス中断: ${cmd}`);
         proc.kill('SIGKILL');
       }
     }, timeoutMs);
@@ -70,7 +144,6 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     return res.status(400).json({ error: 'ファイルがアップロードされていません。' });
   }
 
-  // 重複パラメータ (例: avi,avi) の自動クレンジング
   let rawFormat = req.body.format || 'mp4';
   const cleanFormat = rawFormat.split(',')[0].trim().toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
 
@@ -78,9 +151,6 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   const framerate = req.body.framerate || 'original';
   const vcodec = req.body.vcodec || '';
   const acodec = req.body.acodec || '';
-  const videoBitrate = req.body.videoBitrate || '';
-  const audioBitrate = req.body.audioBitrate || '';
-  const sampleRate = req.body.sampleRate || '';
 
   const timestamp = Date.now();
   const inputPath = req.file.path;
@@ -96,13 +166,13 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   };
 
   try {
-    console.log(`[${timestamp}] 変換リクエスト開始: ${req.file.originalname} -> ${cleanFormat}`);
+    console.log(`[${timestamp}] 変換要求: ${req.file.originalname} -> ${cleanFormat}`);
 
-    // STEP 1: ExifTool 事前クレンジング (失敗しても止まらず続行)
+    // STEP 1: ExifTool 処理
     const preExifArgs = ['-overwrite_original', '-all=', '-tagsFromFile', inputPath, '-all:all', inputPath];
     await runSafeCommand('exiftool', preExifArgs, 15000);
 
-    // STEP 2: FFmpeg コマンド組み立て
+    // STEP 2: FFmpeg 変換
     const ffmpegArgs = [
       '-y',
       '-nostdin',
@@ -135,10 +205,6 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       ffmpegArgs.push('-r', framerate);
     }
 
-    if (videoBitrate) {
-      ffmpegArgs.push('-b:v', videoBitrate);
-    }
-
     if (acodec) {
       ffmpegArgs.push('-c:a', acodec);
     } else if (cleanFormat === 'avi') {
@@ -147,14 +213,6 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       ffmpegArgs.push('-c:a', 'libopus');
     } else {
       ffmpegArgs.push('-c:a', 'aac');
-    }
-
-    if (sampleRate && !isNaN(sampleRate)) {
-      ffmpegArgs.push('-ar', sampleRate);
-    }
-
-    if (audioBitrate) {
-      ffmpegArgs.push('-b:a', audioBitrate);
     }
 
     if (cleanFormat === 'mp4' || cleanFormat === 'mov') {
@@ -169,7 +227,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       throw new Error(`FFmpeg 変換失敗: ${ffmpegResult.stderr.slice(-300)}`);
     }
 
-    // STEP 3: ExifTool 後処理 (MP4/MOVの場合)
+    // STEP 3: ExifTool 後処理
     if (cleanFormat === 'mp4' || cleanFormat === 'mov') {
       const postExifArgs = [
         '-overwrite_original_in_place',
@@ -189,12 +247,12 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       : ffmpegOutputPath;
 
     res.download(sendFilePath, `output.${cleanFormat}`, (err) => {
-      if (err) console.error('ファイル送信エラー:', err);
+      if (err) console.error('送信エラー:', err);
       cleanup();
     });
 
   } catch (err) {
-    console.error(`[${timestamp}] 変換エラー:`, err.message);
+    console.error(`[${timestamp}] エラー:`, err.message);
     cleanup();
     return res.status(500).json({
       error: '動画の変換処理に失敗しました。',
@@ -204,7 +262,5 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`サーバーが起動しました: Port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
 
