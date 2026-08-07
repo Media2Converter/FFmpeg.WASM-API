@@ -1,24 +1,14 @@
 {
-  "name": "ffmpeg-exiftool-api",
+  "name": "ffmpeg-wasm-api",
   "version": "1.0.0",
-  "description": "FFmpeg and ExifTool Media Conversion API with ESLint",
+  "description": "Media Converter API Server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.9.0",
-    "eslint": "^9.9.0",
-    "globals": "^15.9.0"
-  },
-  "engines": {
-    "node": ">=20.0.0"
   }
 }
 
