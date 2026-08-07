@@ -1,0 +1,14 @@
+{
+  "name": "FFmpeg Server Container",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-20-bullseye",
+  "updateContentCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg libimage-exiftool-perl && npm install",
+  "postStartCommand": "node server.js",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "FFmpeg API",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  }
+}
